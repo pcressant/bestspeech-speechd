@@ -1,0 +1,45 @@
+{
+  "nodes": {
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1794537146,
+        "narHash": "sha256-Wpz/7x/YWnDIBu7yj6ixe8j6fIMsidd9Y+o1PqPF3iM=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "d5cc6833999746cffdfe0598f7bc801a57b887a9",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "openbst": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1789921989,
+        "narHash": "sha256-q9L5967E+rE7dc25RmYxX7Qen8Kn7b1VySnkMmnrZaQ=",
+        "owner": "Mudb0y",
+        "repo": "openbst",
+        "rev": "a151e78f66009bc74367974d14476061f3552346",
+        "type": "github"
+      },
+      "original": {
+        "owner": "Mudb0y",
+        "repo": "openbst",
+        "rev": "a151e78f66009bc74367974d14476061f3552346",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "nixpkgs": "nixpkgs",
+        "openbst": "openbst"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}

@@ -1,0 +1,15 @@
+diff --git a/src/speak.c b/src/speak.c
+index ca3e4fd..eac9186 100644
+--- a/src/speak.c
++++ b/src/speak.c
+@@ -183,6 +183,10 @@ static int *setting(bst *h, const char *name) {
+     if (!strcmp(name, "level")) return &h->level;
+     if (!strcmp(name, "voice")) return &h->voice;
+     if (!strcmp(name, "rate"))  return &h->rate;
++    /* The excitation and the gain trim the embedded e and u commands set,
++       which the speech-dispatcher module needs for the voice presets. */
++    if (!strcmp(name, "excitation")) return &h->defexc;
++    if (!strcmp(name, "gain"))       return &h->gain_adj;
+     return NULL;
+ }
+ 
