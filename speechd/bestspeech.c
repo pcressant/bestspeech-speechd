@@ -20,6 +20,9 @@
  * sentence is made, which takes well under a millisecond.
  */
 
+/* strcasecmp, strtok_r and iconv are POSIX; the rest is C11. */
+#define _POSIX_C_SOURCE 200809L
+
 #include <ctype.h>
 #include <iconv.h>
 #include <math.h>
@@ -33,6 +36,8 @@
 
 #include <speech-dispatcher/spd_module_main.h>
 
+#include "french.h"
+
 #include <sonic.h>
 
 #include "bst.h"
@@ -45,6 +50,7 @@ typedef struct {
     const char *language; /* what Speech Dispatcher is told */
     const char *codeset;  /* what the build reads its text in */
     int commaEndsText;    /* says nothing after the first comma */
+    int spellsC;          /* reads every c as s: see french.c */
     double gain;          /* brings its loudness into line with the others */
 } BuildInfo;
 
@@ -61,11 +67,11 @@ typedef struct {
  * about 1360. The gains bring all of them to about 5000; espeak-ng gives
  * about 3100 at the same volume. */
 static const BuildInfo builds[] = {
-    { "2006FRE", "fr-2006", "fr", "CP1252", 1, 3.7 },
-    { "1998FRN", "fr-1998", "fr", "CP850",  0, 0.6 },
-    { "1995",    "en-1995", "en", "CP850",  0, 1.0 },
-    { "1998ENG", "en-1998", "en", "CP850",  0, 0.6 },
-    { "2006ENG", "en-2006", "en", "CP1252", 1, 3.7 },
+    { "2006FRE", "fr-2006", "fr", "CP1252", 1, 1, 3.7 },
+    { "1998FRN", "fr-1998", "fr", "CP850",  0, 0, 0.6 },
+    { "1995",    "en-1995", "en", "CP850",  0, 0, 1.0 },
+    { "1998ENG", "en-1998", "en", "CP850",  0, 0, 0.6 },
+    { "2006ENG", "en-2006", "en", "CP1252", 1, 0, 3.7 },
 };
 enum { BUILD_COUNT = sizeof builds / sizeof builds[0] };
 
@@ -698,7 +704,14 @@ static int queue_points(int b, const Points *p, int suppressPunctuation,
                             result = add_icon("capital", 7);
                     }
                 }
-                if (c == ',' && builds[b].commaEndsText)
+                uint32_t lc = c == 'C' ? 'c' : c == 0xC7 ? 0xE7 : c;
+                if (builds[b].spellsC && (lc == 'c' || lc == 0xE7)) {
+                    /* The build would say the letter as s. */
+                    encode_char(b, 's', &piece.text);
+                    encode_char(b, 0xE9, &piece.text);
+                    if (lc == 0xE7)
+                        buffer_append_str(&piece.text, " s\xe9" "dille");
+                } else if (c == ',' && builds[b].commaEndsText)
                     buffer_append_str(&piece.text, word_for(b, "comma", "virgule"));
                 else
                     encode_char(b, c, &piece.text);
@@ -760,12 +773,32 @@ static int queue_points(int b, const Points *p, int suppressPunctuation,
     return result;
 }
 
+/* French text respelled for the build (see french.c), in place. Spelled
+ * text is left alone: it is said a letter at a time. */
+static int respell(int b, Points *p, int spell)
+{
+    uint32_t *out;
+
+    if (spell || !is_french(b) || p->n == 0)
+        return 0;
+    size_t capacity = 2 * p->n + 16;
+    if (!(out = malloc(capacity * sizeof *out)))
+        return -1;
+    p->n = french_respell(p->v, p->n, out, builds[b].spellsC);
+    free(p->v);
+    p->v = out;
+    p->capacity = capacity;
+    return 0;
+}
+
 static int queue_text(int b, const char *text, int suppressPunctuation,
                       int spell)
 {
     Points p = { 0 };
     int result = decode_utf8(&p, text, strlen(text));
 
+    if (result == 0)
+        result = respell(b, &p, spell);
     if (result == 0)
         result = queue_points(b, &p, suppressPunctuation, spell);
     free(p.v);
@@ -1090,6 +1123,8 @@ static int queue_message(int b, const char *data, SPDMessageType type)
     }
     result = contains_markup(data) ? parse_ssml(&p, data)
                                    : decode_utf8(&p, data, strlen(data));
+    if (result == 0)
+        result = respell(b, &p, spell);
     if (result == 0)
         result = queue_points(b, &p, suppress, spell);
     free(p.v);

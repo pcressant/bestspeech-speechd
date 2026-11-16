@@ -214,6 +214,15 @@ def raw_checks(module, bstspeak):
     assert event == "702 END" and marks == ORCA_MARKS, marks
     assert audio == direct(bstspeak, "2006FRE", ORCA_TEXT, "ascii")
 
+    step("2006: every c spelled out, since the build reads them all as s")
+    audio, _, _ = module.speak("Comme aucun garçon, avec ceci.")
+    assert audio == direct(bstspeak, "2006FRE", "Komme aukun garson: avek sessi.", "cp1252")
+    assert audio != direct(bstspeak, "2006FRE", "Comme aucun garçon: avec ceci.", "cp1252")
+    audio, _, _ = module.speak("c", command="CHAR")
+    assert audio == direct(bstspeak, "2006FRE", "sé ", "cp1252")
+    audio, _, _ = module.speak("après la pluie")
+    assert audio == direct(bstspeak, "2006FRE", "aprè la pluie", "cp1252")
+
     step("2006: a comma is a phrase break, not the end of the text")
     assert direct(bstspeak, "2006FRE", "Bonjour, au revoir.", "ascii") == \
         direct(bstspeak, "2006FRE", "Bonjour,", "ascii")

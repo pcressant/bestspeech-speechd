@@ -58,10 +58,17 @@ $(BUILD)/lifted-fren.o: src/lifted-fren.c $(SRCDIR)/.patched
 $(BUILD)/libbst-fren.a: $(BSTOBJ)
 	$(AR) rcs $@ $^
 
-$(BUILD)/sd_bestspeech: speechd/bestspeech.c speechd/spd_audio.h $(BUILD)/libbst-fren.a
-	$(CC) $(CFLAGS) $(WARN) -std=gnu11 -Ispeechd $(BSTINC) $(SPEECHD_CFLAGS) \
-	    speechd/bestspeech.c $(BUILD)/libbst-fren.a $(SPEECHD_LIBS) $(SONIC_LIBS) \
+MODSRC := speechd/bestspeech.c speechd/french.c
+
+$(BUILD)/sd_bestspeech: $(MODSRC) speechd/french.h speechd/spd_audio.h $(BUILD)/libbst-fren.a
+	$(CC) $(CFLAGS) $(WARN) -std=c11 -Ispeechd $(BSTINC) $(SPEECHD_CFLAGS) \
+	    $(MODSRC) $(BUILD)/libbst-fren.a $(SPEECHD_LIBS) $(SONIC_LIBS) \
 	    -lm -o $@
+
+# The French respelling on its own, for test/french.py.
+$(BUILD)/frspell: tools/frspell.c speechd/french.c speechd/french.h
+	@mkdir -p $(BUILD)
+	$(CC) $(CFLAGS) $(WARN) -std=c11 -Ispeechd tools/frspell.c speechd/french.c -o $@
 
 # openbst's own command and self-test, on the same cut-down library: the
 # reference the module's audio is compared against, and the check that the
@@ -81,8 +88,18 @@ $(BUILD)/golden-fren.txt: $(SRCDIR)/.patched
 selftest: $(BUILD)/selftest $(BUILD)/golden-fren.txt
 	$(BUILD)/selftest $(BUILD)/golden-fren.txt
 
-test: selftest $(BUILD)/sd_bestspeech $(BUILD)/bstspeak
+test: selftest $(BUILD)/sd_bestspeech $(BUILD)/bstspeak $(BUILD)/frspell
+	python3 test/french.py $(BUILD)/frspell
 	python3 test/speechd.py $(BUILD)/sd_bestspeech speechd/bestspeech.conf $(BUILD)/bstspeak
+
+# The French builds against espeak-ng over a word list, one word to a line
+# (Hunspell's French .dic will do): needs espeak-ng. Not part of test.
+WORDS ?= /usr/share/hunspell/fr.dic
+$(BUILD)/phdump: tools/phdump.c $(BUILD)/libbst-fren.a
+	$(CC) $(CFLAGS) $(WARN) -std=c11 $(BSTINC) tools/phdump.c $(BUILD)/libbst-fren.a -lm -o $@
+
+frcheck: $(BUILD)/phdump $(BUILD)/frspell
+	python3 tools/frcheck.py $(BUILD) $(WORDS)
 
 install: $(BUILD)/sd_bestspeech
 	install -d $(DESTDIR)$(SPEECHD_MODULEDIR) $(DESTDIR)$(SPEECHD_CONFDIR)
@@ -92,4 +109,4 @@ install: $(BUILD)/sd_bestspeech
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all selftest test install clean
+.PHONY: all selftest test frcheck install clean

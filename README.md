@@ -112,6 +112,22 @@ arrondies au lieu d'être écrêtées.
 - **Filet de sécurité.** Une phrase qui contient des mots ne revient
   jamais muette. Elle est d'abord redite sans ses caractères accentués,
   puis mot à mot en dernier recours.
+- **La lettre c dans la 2006 français.** Cette version lit tout c, C
+  et ç comme un s avant ses règles de prononciation : « comme » donne
+  « somme », « aucun » donne « ausun ». La DLL d'origine fait de même :
+  le logiciel hôte du Keynote devait corriger le texte avant de le lui
+  passer. Le module fait ce travail dans `speechd/french.c` : c dur → k,
+  c doux → s (ss entre voyelles), « accès » → ks, « chrome » et
+  « psychologie » → k, « direct » prononcé jusqu'au t, « blanc » et
+  « tabac » sans leur c. Seule, la lettre se dit « cé ».
+- **« après »** se dit « aprèz » dans les deux versions françaises, quoi
+  qu'il suive ; le module ne garde le z que devant une voyelle.
+- **Vérification au dictionnaire.** `make frcheck WORDS=fr.dic` compare
+  les phonèmes de chaque mot d'une liste (le dictionnaire Hunspell
+  français, par exemple) à ceux d'espeak-ng. Sur 63 570 mots : 2006
+  réécrite 12,1 % d'écarts, 2006 brute 35,5 %, 1998 12,6 %. Le reste
+  tient surtout aux o ouverts ou fermés, au [ɥ] de « nuage » et aux mots
+  empruntés.
 - **Les commandes intégrées** `~v3]`, `~f80]` de la DLL ne sont pas
   comprises par openbst, qui les lit à voix haute. Le module applique
   donc les préréglages par des réglages. Le petit correctif
@@ -136,11 +152,13 @@ d'openbst :
     make OPENBST=/chemin/vers/openbst test
     make PREFIX=/usr/local install
 
-`make test` fait trois choses, sans serveur ni son :
+`make test` fait quatre choses, sans serveur ni son :
 
 - il lance le self-test d'openbst sur la bibliothèque réduite et
   corrigée : 1299 énoncés identiques à ce qu'ont dit les binaires
   d'origine ;
+- il vérifie la réécriture française sur une liste de mots
+  (`test/french.py`) ;
 - il pilote le module en sortie brute (`RawOutput 1`, réservé aux
   tests) et compare l'audio, sample par sample, avec `bstspeak` pour le
   texte que le module doit lui passer ;
