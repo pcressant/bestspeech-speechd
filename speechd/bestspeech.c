@@ -11,6 +11,13 @@
  *
  * Only the French and English builds are offered: 2006 and 1998 French,
  * 1995, 1998 and 2006 English.
+ *
+ * Responsiveness is the point of most of what follows. A screen reader puts
+ * an index mark before every word; the module says a whole sentence in one
+ * go and places the marks in its audio, instead of saying each word as a
+ * sentence of its own. The silence the engine leaves before and after its
+ * speech is cut down, and a message starts sounding as soon as its first
+ * sentence is made, which takes well under a millisecond.
  */
 
 #include <ctype.h>
@@ -38,21 +45,27 @@ typedef struct {
     const char *language; /* what Speech Dispatcher is told */
     const char *codeset;  /* what the build reads its text in */
     int commaEndsText;    /* says nothing after the first comma */
+    double gain;          /* brings its loudness into line with the others */
 } BuildInfo;
 
 /* The 2006 builds fold the Windows Western set into their own encoding. The
  * 1995 and 1998 ones read the DOS set: a Windows byte above 0x7f makes them
  * say nothing at all.
  *
- * Handed a whole text in one call, the 2006 builds stop at its first comma:
- * "Bonjour, au revoir." comes out as "Bonjour". Their host fed them a phrase
- * at a time, so the module does the same and ends a piece at every comma. */
+ * The 2006 builds read a comma as the end of the text: "Bonjour, au revoir."
+ * comes out as "Bonjour". A colon gives them the same phrase break without
+ * ending anything, so a comma reaches them as one.
+ *
+ * Loudness, measured as the RMS of the voiced samples of a French sentence:
+ * 1995 about 4900, the 1998 builds over 8000 and clipping, the 2006 builds
+ * about 1360. The gains bring all of them to about 5000; espeak-ng gives
+ * about 3100 at the same volume. */
 static const BuildInfo builds[] = {
-    { "2006FRE", "fr-2006", "fr", "CP1252", 1 },
-    { "1998FRN", "fr-1998", "fr", "CP850",  0 },
-    { "1995",    "en-1995", "en", "CP850",  0 },
-    { "1998ENG", "en-1998", "en", "CP850",  0 },
-    { "2006ENG", "en-2006", "en", "CP1252", 1 },
+    { "2006FRE", "fr-2006", "fr", "CP1252", 1, 3.7 },
+    { "1998FRN", "fr-1998", "fr", "CP850",  0, 0.6 },
+    { "1995",    "en-1995", "en", "CP850",  0, 1.0 },
+    { "1998ENG", "en-1998", "en", "CP850",  0, 0.6 },
+    { "2006ENG", "en-2006", "en", "CP1252", 1, 3.7 },
 };
 enum { BUILD_COUNT = sizeof builds / sizeof builds[0] };
 
@@ -112,6 +125,7 @@ typedef struct {
 } ModuleSettings;
 
 static ModuleSettings settings = {
+    .volume = 100,
     .punctuation = SPD_PUNCT_NONE,
     .spelling = SPD_SPELL_OFF,
     .capitals = SPD_CAP_NONE,
@@ -126,6 +140,7 @@ static iconv_t translitConv[BUILD_COUNT];
 static SPDVoice **voiceList;
 static int defaultBuild[2] = { 0, 2 }; /* fr, en */
 static double maxSpeed = 4.0;
+static int rawOutput;      /* the engine's samples untouched, for the tests */
 static volatile int stopRequested;
 static volatile int pauseRequested;
 static FILE *debugFile;
@@ -160,6 +175,17 @@ static char *copy_string(const char *value)
     return copy;
 }
 
+static char *copy_bytes(const char *value, size_t length)
+{
+    char *copy = malloc(length + 1);
+
+    if (copy) {
+        memcpy(copy, value, length);
+        copy[length] = 0;
+    }
+    return copy;
+}
+
 static int parse_number(const char *value, int minimum, int maximum, int *out)
 {
     char *end;
@@ -177,6 +203,11 @@ static int build_index(const char *name)
         if (!strcasecmp(builds[i].build, name) || !strcasecmp(builds[i].tag, name))
             return i;
     return -1;
+}
+
+static int clamp(int value, int low, int high)
+{
+    return value < low ? low : value > high ? high : value;
 }
 
 /* ---- growable buffers ----------------------------------------------------- */
@@ -212,13 +243,74 @@ static int buffer_append_str(Buffer *b, const char *text)
     return buffer_append(b, text, strlen(text));
 }
 
+/* Code points, with the index marks among them as values above Unicode. */
+typedef struct {
+    uint32_t *v;
+    size_t n, capacity;
+} Points;
+
+enum { MARK_BASE = 0x200000 };
+
+static int points_push(Points *p, uint32_t c)
+{
+    if (p->n == p->capacity) {
+        size_t capacity = p->capacity ? p->capacity * 2 : 256;
+        uint32_t *grown = realloc(p->v, capacity * sizeof *grown);
+
+        if (!grown)
+            return -1;
+        p->v = grown;
+        p->capacity = capacity;
+    }
+    p->v[p->n++] = c;
+    return 0;
+}
+
+/* The names of this message's index marks. */
+static char **markNames;
+static size_t markNameCount, markNameCapacity;
+
+static void clear_mark_names(void)
+{
+    for (size_t i = 0; i < markNameCount; i++)
+        free(markNames[i]);
+    markNameCount = 0;
+}
+
+static int add_mark_name(const char *name, size_t length, uint32_t *code)
+{
+    if (markNameCount == markNameCapacity) {
+        size_t capacity = markNameCapacity ? markNameCapacity * 2 : 32;
+        char **grown = realloc(markNames, capacity * sizeof *grown);
+
+        if (!grown)
+            return -1;
+        markNames = grown;
+        markNameCapacity = capacity;
+    }
+    if (!(markNames[markNameCount] = copy_bytes(name, length)))
+        return -1;
+    *code = MARK_BASE + (uint32_t)markNameCount++;
+    return 0;
+}
+
 /* ---- the queue one message becomes --------------------------------------- */
 
-enum { ITEM_TEXT, ITEM_MARK, ITEM_ICON };
+typedef struct {
+    size_t offset; /* in the engine text, where the mark stands */
+    char *name;
+} PieceMark;
+
+enum { ITEM_TEXT, ITEM_ICON };
+enum { END_NONE, END_PHRASE, END_SENTENCE };
 
 typedef struct {
     int kind;
-    char *value; /* engine text, mark name or icon name */
+    char *text;          /* engine text, NULL for marks alone; icon name */
+    size_t length;
+    PieceMark *marks;
+    size_t markCount;
+    int ending;          /* how the piece ends, for the pause after it */
 } Item;
 
 static Item *items;
@@ -226,33 +318,102 @@ static size_t itemCount, itemCapacity;
 
 static void clear_items(void)
 {
-    for (size_t i = 0; i < itemCount; i++)
-        free(items[i].value);
+    for (size_t i = 0; i < itemCount; i++) {
+        free(items[i].text);
+        for (size_t k = 0; k < items[i].markCount; k++)
+            free(items[i].marks[k].name);
+        free(items[i].marks);
+    }
     itemCount = 0;
 }
 
-static int add_item(int kind, const char *value, size_t length)
+static Item *new_item(int kind)
 {
-    char *copy;
-
     if (itemCount == itemCapacity) {
         size_t capacity = itemCapacity ? itemCapacity * 2 : 16;
         Item *grown = realloc(items, capacity * sizeof *items);
 
         if (!grown)
-            return -1;
+            return NULL;
         items = grown;
         itemCapacity = capacity;
     }
-    copy = malloc(length + 1);
-    if (!copy)
-        return -1;
-    memcpy(copy, value, length);
-    copy[length] = 0;
+    memset(&items[itemCount], 0, sizeof items[itemCount]);
     items[itemCount].kind = kind;
-    items[itemCount].value = copy;
-    itemCount++;
+    return &items[itemCount++];
+}
+
+static int add_icon(const char *name, size_t length)
+{
+    Item *item = new_item(ITEM_ICON);
+
+    if (!item || !(item->text = copy_bytes(name, length)))
+        return -1;
     return 0;
+}
+
+/* The piece being built: engine text and the marks that fall in it. */
+typedef struct {
+    Buffer text;
+    PieceMark *marks;
+    size_t markCount, markCapacity;
+} PieceBuilder;
+
+static int piece_mark(PieceBuilder *p, const char *name)
+{
+    if (p->markCount == p->markCapacity) {
+        size_t capacity = p->markCapacity ? p->markCapacity * 2 : 16;
+        PieceMark *grown = realloc(p->marks, capacity * sizeof *grown);
+
+        if (!grown)
+            return -1;
+        p->marks = grown;
+        p->markCapacity = capacity;
+    }
+    p->marks[p->markCount].offset = p->text.length;
+    if (!(p->marks[p->markCount].name = copy_string(name)))
+        return -1;
+    p->markCount++;
+    return 0;
+}
+
+/* Ends the piece being built. Text that is nothing but spaces is not said:
+ * the 2006 builds say an empty text as most of a second of silence. */
+static int piece_flush(PieceBuilder *p, int ending)
+{
+    size_t i;
+    int blank;
+    Item *item;
+
+    for (i = 0; i < p->text.length && p->text.data[i] == ' '; i++)
+        ;
+    blank = i == p->text.length;
+    if (blank && !p->markCount)
+        return 0;
+    if (!(item = new_item(ITEM_TEXT)))
+        return -1;
+    if (!blank) {
+        if (!(item->text = copy_bytes(p->text.data, p->text.length)))
+            return -1;
+        item->length = p->text.length;
+    }
+    item->marks = p->marks;
+    item->markCount = p->markCount;
+    item->ending = ending;
+    p->marks = NULL;
+    p->markCount = p->markCapacity = 0;
+    p->text.length = 0;
+    if (p->text.data)
+        p->text.data[0] = 0;
+    return 0;
+}
+
+static void piece_free(PieceBuilder *p)
+{
+    free(p->text.data);
+    for (size_t i = 0; i < p->markCount; i++)
+        free(p->marks[i].name);
+    free(p->marks);
 }
 
 /* ---- text ------------------------------------------------------------------ */
@@ -276,6 +437,17 @@ static uint32_t utf8_next(const unsigned char **at)
     }
     *at = p + 1 + extra;
     return c;
+}
+
+static int decode_utf8(Points *out, const char *text, size_t length)
+{
+    const unsigned char *at = (const unsigned char *)text;
+    const unsigned char *end = at + length;
+
+    while (at < end && *at)
+        if (points_push(out, utf8_next(&at)))
+            return -1;
+    return 0;
 }
 
 static void utf8_put(Buffer *b, uint32_t c)
@@ -338,13 +510,18 @@ static int is_droppable_symbol(uint32_t c)
 /* BstSpeech-sapi's clean-up, as code points: the typographic marks become the
  * plain ones the engine knows, line breaks and other control characters
  * become spaces, and so do the no-break spaces French typography puts before
- * its marks. A tilde is dropped: it is the engine's own command lead-in, and
- * a tilde and bar in the text would end the phrase. */
-static uint32_t normalize(uint32_t c, int *expandEllipsis)
+ * its marks and inside its numbers. A tilde is dropped: it is the engine's
+ * own command lead-in, and a tilde and bar in the text would end the phrase.
+ * An ellipsis comes back as a full stop, with *ellipsis set. */
+static uint32_t normalize(uint32_t c, int *ellipsis)
 {
-    *expandEllipsis = 0;
+    if (ellipsis)
+        *ellipsis = 0;
     switch (c) {
-    case 0x2026: *expandEllipsis = 1; return '.';
+    case 0x2026:
+        if (ellipsis)
+            *ellipsis = 1;
+        return '.';
     case 0x2010: case 0x2011: case 0x2012: case 0x2013: case 0x2014:
     case 0x2015: case 0x2212:
         return '-';
@@ -365,6 +542,55 @@ static uint32_t normalize(uint32_t c, int *expandEllipsis)
     if (c < 0x20 || c == 0x7F || (c >= 0x80 && c < 0xA0))
         return ' ';
     return c;
+}
+
+/* The next character after position i that is neither a mark nor dropped,
+ * normalized; a space at the end of the text. *where is its position. */
+static uint32_t peek_char(const Points *p, size_t i, size_t *where)
+{
+    for (; i < p->n; i++) {
+        uint32_t c;
+
+        if (p->v[i] >= MARK_BASE)
+            continue;
+        if ((c = normalize(p->v[i], NULL)) != 0) {
+            if (where)
+                *where = i;
+            return c;
+        }
+    }
+    if (where)
+        *where = p->n;
+    return ' ';
+}
+
+/* The same, past any spaces. */
+static uint32_t peek_nonspace(const Points *p, size_t i, size_t *where)
+{
+    size_t at = i;
+    uint32_t c;
+
+    while ((c = peek_char(p, at, &at)) == ' ' && at < p->n)
+        at++;
+    if (where)
+        *where = at;
+    return c;
+}
+
+/* How many digits run from position i: three after a space is the shape of
+ * a French thousands group. */
+static size_t digit_run(const Points *p, size_t i)
+{
+    size_t n = 0, at = i;
+
+    for (;;) {
+        uint32_t c = peek_char(p, at, &at);
+
+        if (!is_digit(c))
+            return n;
+        n++;
+        at++;
+    }
 }
 
 /* One code point into the build's code set: strictly if it has the
@@ -403,110 +629,146 @@ static void encode_char(int b, uint32_t c, Buffer *out)
     buffer_append(out, " ", 1);
 }
 
+static int is_french(int b)
+{
+    return !strcmp(builds[b].language, "fr");
+}
+
 static const char *word_for(int b, const char *english, const char *french)
 {
-    return !strcmp(builds[b].language, "fr") ? french : english;
+    return is_french(b) ? french : english;
 }
 
-/* Ends the piece being built, unless there is nothing in it but spaces:
- * the 2006 builds say an empty text as most of a second of silence. */
-static int flush_piece(Buffer *out)
+/* Turns code points into engine text pieces, one to a sentence: a long text
+ * starts sounding as soon as its first sentence is made, and a stop never
+ * waits on more than one. The marks stay inside the pieces.
+ *
+ * Numbers need help. In every build two numbers with one space between them
+ * make the whole sentence silent ("10 30", "1 2"), and so does a comma
+ * between digits ("3,5"). Two spaces are safe; a comma between digits becomes
+ * "virgule" in French; a group of three digits after one space is the French
+ * way of writing thousands and is joined to the number before it. */
+static int queue_points(int b, const Points *p, int suppressPunctuation,
+                        int spell)
 {
-    size_t i;
-    int result = 0;
-
-    for (i = 0; i < out->length && out->data[i] == ' '; i++)
-        ;
-    if (i < out->length)
-        result = add_item(ITEM_TEXT, out->data, out->length);
-    out->length = 0;
-    if (out->data)
-        out->data[0] = 0;
-    return result;
-}
-
-/* Turns UTF-8 text into engine text items, one to a sentence so that a long
- * text starts speaking as soon as its first sentence is ready and a stop
- * never waits on more than one. */
-static int queue_text(int b, const char *text, int suppressPunctuation,
-                      int spell)
-{
-    const unsigned char *at = (const unsigned char *)text;
-    Buffer out = { 0 };
+    PieceBuilder piece = { 0 };
     uint32_t previous = ' ', beforeSpace = ' ';
     size_t sinceBreak = 0;
     int result = 0;
+    int inNumberGap = 0;
 
-    buffer_append(&out, "", 0);
-    while (*at && result == 0) {
-        uint32_t raw = utf8_next(&at);
-        int ellipsis;
-        uint32_t c = normalize(raw, &ellipsis);
-        uint32_t next;
-        const unsigned char *peek = at;
+    buffer_append(&piece.text, "", 0);
+    for (size_t i = 0; i < p->n && result == 0; i++) {
+        int ellipsis, splitAfter = 0;
+        uint32_t c, next;
+        size_t nextAt;
 
-        if (!c)
+        if (p->v[i] >= MARK_BASE) {
+            result = piece_mark(&piece, markNames[p->v[i] - MARK_BASE]);
             continue;
-        next = *peek ? normalize(utf8_next(&peek), &(int){ 0 }) : ' ';
+        }
+        if (!(c = normalize(p->v[i], &ellipsis)))
+            continue;
+        next = peek_char(p, i + 1, &nextAt);
 
         if (suppressPunctuation && !spell && is_droppable_symbol(c)
             && !(c == '\'' && is_letter_or_digit(previous)
                  && is_letter_or_digit(next)))
             c = ' ';
 
-        int commaWritten = 0;
+        if (inNumberGap) {
+            if (c == ' ')
+                continue;
+            inNumberGap = 0;
+        }
 
-        if (spell && c != ' ') {
-            if (settings.capitals != SPD_CAP_NONE && is_upper(c)) {
-                if (settings.capitals == SPD_CAP_SPELL) {
-                    buffer_append_str(&out, " ");
-                    buffer_append_str(&out, word_for(b, "capital", "majuscule"));
-                    buffer_append_str(&out, " ");
-                } else {
-                    if (flush_piece(&out))
-                        result = -1;
-                    if (add_item(ITEM_ICON, "capital", 7))
-                        result = -1;
+        if (spell) {
+            if (c == ' ') {
+                buffer_append(&piece.text, " ", 1);
+            } else {
+                if (settings.capitals != SPD_CAP_NONE && is_upper(c)) {
+                    if (settings.capitals == SPD_CAP_SPELL) {
+                        buffer_append_str(&piece.text, " ");
+                        buffer_append_str(&piece.text,
+                                          word_for(b, "capital", "majuscule"));
+                        buffer_append_str(&piece.text, " ");
+                    } else {
+                        result = piece_flush(&piece, END_NONE);
+                        if (result == 0)
+                            result = add_icon("capital", 7);
+                    }
                 }
+                if (c == ',' && builds[b].commaEndsText)
+                    buffer_append_str(&piece.text, word_for(b, "comma", "virgule"));
+                else
+                    encode_char(b, c, &piece.text);
+                buffer_append(&piece.text, " ", 1);
             }
-            encode_char(b, c, &out);
-            buffer_append(&out, " ", 1);
-            commaWritten = c == ',';
-        } else if (ellipsis) {
-            buffer_append(&out, "...", 3);
-        } else if (c == ',' && builds[b].commaEndsText
+        } else if (c == ' ' && is_digit(previous)) {
+            /* Spaces between two numbers. */
+            uint32_t after = peek_nonspace(p, i, &nextAt);
+            size_t spaces = 0;
+
+            for (size_t k = i; k < nextAt; k++)
+                if (p->v[k] < MARK_BASE && normalize(p->v[k], NULL) == ' ')
+                    spaces++;
+            if (!is_digit(after)) {
+                buffer_append(&piece.text, " ", 1);
+            } else {
+                size_t run = digit_run(p, nextAt);
+                if (!(spaces == 1 && run == 3))
+                    buffer_append(&piece.text, "  ", 2);
+                inNumberGap = 1;
+            }
+        } else if ((c == ',' || c == ':') && is_digit(next)
                    && (is_digit(previous)
-                       || (previous == ' ' && is_digit(beforeSpace)))
-                   && is_digit(next)) {
-            /* A comma between digits would cut the number off too: in French
-               it is the decimal mark, in English the thousands separator.
-               Speech Dispatcher's symbol pass writes 1,5 as "1 ,5". */
-            if (!strcmp(builds[b].language, "fr"))
-                buffer_append_str(&out, " virgule ");
+                       || (previous == ' ' && is_digit(beforeSpace)))) {
+            /* A comma or colon between digits. Speech Dispatcher's symbol
+               pass writes 1,5 as "1 ,5". */
+            size_t run = digit_run(p, nextAt);
+            if (c == ',' && is_french(b))
+                buffer_append_str(&piece.text, " virgule ");
+            else if (!(c == ',' && run == 3))
+                buffer_append(&piece.text, "  ", 2);
+        } else if (ellipsis) {
+            buffer_append(&piece.text, "...", 3);
+        } else if (c == ',' && builds[b].commaEndsText) {
+            buffer_append(&piece.text, ":", 1);
         } else {
-            encode_char(b, c, &out);
-            commaWritten = c == ',';
+            encode_char(b, c, &piece.text);
+            splitAfter = (c == '.' || c == '?' || c == '!' || c == ';'
+                          || c == ':') && next == ' ';
         }
         sinceBreak++;
 
-        /* A sentence ends at its mark when a space follows, and in the 2006
-           builds a phrase ends at any comma; a run with no mark at all is
-           broken at a space once it is long. */
-        if (((c == '.' || c == '?' || c == '!' || c == ';' || c == ':')
-             && next == ' ' && !spell)
-            || (commaWritten && builds[b].commaEndsText)
-            || (c == ' ' && sinceBreak > 400)) {
-            if (flush_piece(&out))
-                result = -1;
+        /* A sentence ends at its mark when a space follows; a run with no
+           mark at all is broken at a space once it is long. */
+        if (splitAfter && !spell) {
+            result = result ? result : piece_flush(&piece, END_SENTENCE);
+            sinceBreak = 0;
+        } else if (c == ' ' && sinceBreak > 300) {
+            result = result ? result : piece_flush(&piece, END_PHRASE);
             sinceBreak = 0;
         }
         if (c != ' ')
             beforeSpace = c;
         previous = c;
     }
-    if (result == 0 && flush_piece(&out))
-        result = -1;
-    free(out.data);
+    if (result == 0)
+        result = piece_flush(&piece, END_NONE);
+    piece_free(&piece);
+    return result;
+}
+
+static int queue_text(int b, const char *text, int suppressPunctuation,
+                      int spell)
+{
+    Points p = { 0 };
+    int result = decode_utf8(&p, text, strlen(text));
+
+    if (result == 0)
+        result = queue_points(b, &p, suppressPunctuation, spell);
+    free(p.v);
     return result;
 }
 
@@ -557,27 +819,23 @@ static const char *find_attribute(const char *tag, size_t length,
     return NULL;
 }
 
-static int append_entity(Buffer *text, const char *entity, size_t length)
+static int push_entity(Points *out, const char *entity, size_t length)
 {
-    static const struct { const char *name, *value; } entities[] = {
-        { "amp", "&" }, { "lt", "<" }, { "gt", ">" },
-        { "quot", "\"" }, { "apos", "'" }, { "nbsp", " " },
+    static const struct { const char *name; uint32_t value; } entities[] = {
+        { "amp", '&' }, { "lt", '<' }, { "gt", '>' },
+        { "quot", '"' }, { "apos", '\'' }, { "nbsp", 0xA0 },
     };
 
     if (length > 1 && entity[0] == '#') {
         long c = entity[1] == 'x' || entity[1] == 'X'
                ? strtol(entity + 2, NULL, 16) : strtol(entity + 1, NULL, 10);
-        if (c > 0 && c < 0x110000) {
-            utf8_put(text, (uint32_t)c);
-            return 0;
-        }
-        return buffer_append(text, " ", 1);
+        return points_push(out, c > 0 && c < 0x110000 ? (uint32_t)c : ' ');
     }
     for (size_t i = 0; i < sizeof entities / sizeof entities[0]; i++)
         if (strlen(entities[i].name) == length
             && !strncmp(entity, entities[i].name, length))
-            return buffer_append_str(text, entities[i].value);
-    return buffer_append(text, " ", 1);
+            return points_push(out, entities[i].value);
+    return points_push(out, ' ');
 }
 
 static int contains_markup(const char *text)
@@ -598,14 +856,13 @@ static int contains_markup(const char *text)
     return 0;
 }
 
-static int queue_ssml(int b, const char *data, int suppressPunctuation,
-                      int spell)
+/* SSML into code points: marks become mark values in the text, breaks a full
+ * stop, other tags nothing, entities their characters. */
+static int parse_ssml(Points *out, const char *data)
 {
-    Buffer text = { 0 };
     const char *at = data;
     int result = 0;
 
-    buffer_append(&text, "", 0);
     while (*at && result == 0) {
         if (*at == '<') {
             const char *end = strchr(at, '>');
@@ -617,37 +874,36 @@ static int queue_ssml(int b, const char *data, int suppressPunctuation,
                 size_t nameLength;
                 const char *name = find_attribute(at, length, "name",
                                                   &nameLength);
+                uint32_t code;
+
                 if (name) {
-                    result = queue_text(b, text.data, suppressPunctuation, spell);
-                    text.length = 0;
-                    text.data[0] = 0;
+                    result = add_mark_name(name, nameLength, &code);
                     if (result == 0)
-                        result = add_item(ITEM_MARK, name, nameLength);
+                        result = points_push(out, code);
                 }
             } else if (tag_matches(at, length, "break")) {
-                result = buffer_append(&text, ". ", 2);
+                result = points_push(out, '.');
+                if (result == 0)
+                    result = points_push(out, ' ');
             }
             at = end + 1;
         } else if (*at == '&') {
             const char *end = strchr(at + 1, ';');
 
             if (end && end - at < 12) {
-                result = append_entity(&text, at + 1, (size_t)(end - at - 1));
+                result = push_entity(out, at + 1, (size_t)(end - at - 1));
                 at = end + 1;
             } else {
-                result = buffer_append(&text, at++, 1);
+                result = points_push(out, (unsigned char)*at++);
             }
         } else {
             const char *end = strpbrk(at, "<&");
             size_t length = end ? (size_t)(end - at) : strlen(at);
 
-            result = buffer_append(&text, at, length);
+            result = decode_utf8(out, at, length);
             at += length;
         }
     }
-    if (result == 0 && text.length)
-        result = queue_text(b, text.data, suppressPunctuation, spell);
-    free(text.data);
     return result;
 }
 
@@ -723,26 +979,25 @@ enum { RATE_POINTS = sizeof rateTable / sizeof rateTable[0] };
 
 /* Speech Dispatcher's -100..100 as a speed: a quarter at -100, the engine's
  * own at 0, MaxSpeed at 100. Whatever the engine cannot reach is left to
- * Sonic, as BstSpeech-sapi did. */
-static void rate_to_engine(int rate, int *native, double *sonic)
+ * Sonic, as BstSpeech-sapi did. Returns the speed. */
+static double rate_to_engine(int rate, int *native, double *sonic)
 {
     double speed = rate >= 0 ? pow(maxSpeed, rate / 100.0)
                              : pow(2.0, rate / 50.0);
 
     *sonic = 1.0;
-    if (rate == 0) {
-        *native = 0;
-        return;
-    }
+    *native = 0;
+    if (rate == 0)
+        return 1.0;
     if (speed <= rateTable[0].speed) {
         *native = rateTable[0].native;
         *sonic = speed / rateTable[0].speed;
-        return;
+        return speed;
     }
     if (speed >= rateTable[RATE_POINTS - 1].speed) {
         *native = rateTable[RATE_POINTS - 1].native;
         *sonic = speed / rateTable[RATE_POINTS - 1].speed;
-        return;
+        return speed;
     }
     for (int i = 1; i < RATE_POINTS; i++) {
         if (speed <= rateTable[i].speed) {
@@ -750,18 +1005,14 @@ static void rate_to_engine(int rate, int *native, double *sonic)
             double t = (log(speed) - a) / (z - a);
             *native = (int)lround(rateTable[i - 1].native
                                   + t * (rateTable[i].native - rateTable[i - 1].native));
-            return;
+            break;
         }
     }
-}
-
-static int clamp(int value, int low, int high)
-{
-    return value < low ? low : value > high ? high : value;
+    return speed;
 }
 
 /* Puts the preset and the relative settings on the build's handle. */
-static void configure(int b, int p, double *sonicSpeed)
+static void configure(int b, int p, double *sonicSpeed, double *speed)
 {
     const Preset *pr = &presets[p];
     bst *h = engines[b];
@@ -782,7 +1033,7 @@ static void configure(int b, int p, double *sonicSpeed)
     bst_set(h, "pitch", floor);
     bst_set(h, "top", top < floor ? floor : top);
     bst_set(h, "level", engineLevel[b]);
-    rate_to_engine(settings.rate, &native, sonicSpeed);
+    *speed = rate_to_engine(settings.rate, &native, sonicSpeed);
     bst_set(h, "rate", native);
     debug_log("build %s preset %s floor %d top %d rate %d sonic %.2f",
               builds[b].build, pr->name, floor, top, native, *sonicSpeed);
@@ -814,10 +1065,11 @@ static int queue_message(int b, const char *data, SPDMessageType type)
     int spell = settings.spelling == SPD_SPELL_ON;
     int result;
     char *prepared = NULL;
+    Points p = { 0 };
 
     switch (type) {
     case SPD_MSGTYPE_SOUND_ICON:
-        return add_item(ITEM_ICON, data, strlen(data));
+        return add_icon(data, strlen(data));
     case SPD_MSGTYPE_KEY:
         prepared = key_text(b, data);
         if (!prepared)
@@ -836,95 +1088,213 @@ static int queue_message(int b, const char *data, SPDMessageType type)
     default:
         break;
     }
-    if (contains_markup(data))
-        return queue_ssml(b, data, suppress, spell);
-    return queue_text(b, data, suppress, spell);
+    result = contains_markup(data) ? parse_ssml(&p, data)
+                                   : decode_utf8(&p, data, strlen(data));
+    if (result == 0)
+        result = queue_points(b, &p, suppress, spell);
+    free(p.v);
+    return result;
 }
 
-/* ---- synthesis and output ----------------------------------------------- */
+/* ---- synthesis -------------------------------------------------------------- */
 
 static int16_t *pcm;
 static long pcmCapacity;
 
-static int ensure_pcm(long samples)
+static int ensure(int16_t **buffer, long *capacity, long samples)
 {
-    if (samples <= pcmCapacity)
+    if (samples <= *capacity)
         return 0;
-    int16_t *grown = realloc(pcm, (size_t)samples * sizeof *pcm);
+    int16_t *grown = realloc(*buffer, (size_t)samples * sizeof *grown);
     if (!grown)
         return -1;
-    pcm = grown;
-    pcmCapacity = samples;
+    *buffer = grown;
+    *capacity = samples;
     return 0;
 }
 
-/* Says one piece of engine text into pcm and returns how many samples. The
- * first guess at the room it needs is generous; a piece that fills it is
- * measured and said again. */
-static long synthesize(bst *h, const char *text)
+/* Says one piece of engine text into *out from position at, and returns how
+ * many samples. The first guess at the room it needs is generous; a piece
+ * that fills it is measured and said again. */
+static long synthesize_into(bst *h, const char *text, int16_t **out,
+                            long *capacity, long at)
 {
     long guess = ((long)strlen(text) + 8) * bst_rate(h) / 4;
     long n;
 
     if (bst_get(h, "rate") > 0)
         guess = guess * (bst_get(h, "rate") + 100) / 100;
-    if (ensure_pcm(guess) != 0)
+    if (ensure(out, capacity, at + guess) != 0)
         return -1;
-    n = bst_say(h, text, pcm, guess);
+    n = bst_say(h, text, *out + at, guess);
     if (n == guess) {
         long need = bst_length(h, text);
-        if (need < 0 || ensure_pcm(need) != 0)
+        if (need < 0 || ensure(out, capacity, at + need) != 0)
             return -1;
-        n = bst_say(h, text, pcm, need);
+        n = bst_say(h, text, *out + at, need);
     }
     return n;
 }
 
-/* The early builds read some characters of the Windows set as nothing at all
- * and say the whole sentence as silence. Should a sentence come back empty,
- * it is said again with everything above 0x7f taken out. */
+static long synthesize(bst *h, const char *text)
+{
+    return synthesize_into(h, text, &pcm, &pcmCapacity, 0);
+}
+
+/* Silence in every build is exactly nought; this is far below anything
+ * that is speech. */
+enum { QUIET = 8 };
+
+static long speech_start(const int16_t *s, long n)
+{
+    long i = 0;
+
+    while (i < n && abs(s[i]) <= QUIET)
+        i++;
+    return i;
+}
+
+static long speech_end(const int16_t *s, long n)
+{
+    long i = n;
+
+    while (i > 0 && abs(s[i - 1]) <= QUIET)
+        i--;
+    return i;
+}
+
+static int has_words(const char *text)
+{
+    for (; *text; text++)
+        if (isalnum((unsigned char)*text) || (unsigned char)*text >= 0x80)
+            return 1;
+    return 0;
+}
+
+/* Says a piece, and never answers a piece with words in it by silence.
+ *
+ * The early builds read some characters of the Windows set as nothing at all
+ * and say the whole sentence as silence; such a sentence is said again with
+ * everything above 0x7f taken out. Whatever else silences a sentence, it is
+ * said a word at a time as a last resort, so that it is at least heard. */
 static long synthesize_safely(bst *h, char *text)
 {
     long n = synthesize(h, text);
-    int high = 0;
 
+    if (n < 0 || speech_end(pcm, n) > speech_start(pcm, n) || !has_words(text))
+        return n;
+
+    int high = 0;
     for (char *c = text; *c; c++)
         if ((unsigned char)*c >= 0x80)
             high = 1;
-    if (n == 0 && high) {
-        for (char *c = text; *c; c++)
-            if ((unsigned char)*c >= 0x80)
-                *c = ' ';
-        debug_log("silent sentence, retried without its high bytes");
-        n = synthesize(h, text);
+    if (high) {
+        char *plain = copy_string(text);
+        if (plain) {
+            for (char *c = plain; *c; c++)
+                if ((unsigned char)*c >= 0x80)
+                    *c = ' ';
+            n = synthesize(h, plain);
+            free(plain);
+            debug_log("silent sentence, retried without its high bytes");
+            if (n < 0 || speech_end(pcm, n) > speech_start(pcm, n))
+                return n;
+        }
     }
-    return n;
+
+    /* A word at a time, each trimmed, with a short gap between them. */
+    static int16_t *words;
+    static long wordsCapacity;
+    long total = 0, gap = bst_rate(h) / 25;
+    char *copy = copy_string(text), *save = NULL;
+
+    debug_log("silent sentence, said a word at a time: %s", text);
+    if (!copy)
+        return 0;
+    for (char *word = strtok_r(copy, " ", &save); word;
+         word = strtok_r(NULL, " ", &save)) {
+        long got = synthesize_into(h, word, &words, &wordsCapacity, total);
+        if (got <= 0)
+            continue;
+        long a = speech_start(words + total, got);
+        long z = speech_end(words + total, got);
+        if (z <= a)
+            continue;
+        memmove(words + total, words + total + a, (size_t)(z - a) * sizeof *words);
+        total += z - a;
+        if (ensure(&words, &wordsCapacity, total + gap) != 0)
+            break;
+        memset(words + total, 0, (size_t)gap * sizeof *words);
+        total += gap;
+    }
+    free(copy);
+    if (ensure(&pcm, &pcmCapacity, total) != 0)
+        return 0;
+    if (total)
+        memcpy(pcm, words, (size_t)total * sizeof *pcm);
+    return total;
 }
 
-static double volume_gain(void)
-{
-    return settings.volume <= 0 ? (settings.volume + 100) / 100.0
-                                : 1.0 + settings.volume / 100.0;
-}
-
+/* Speech Dispatcher's volume 100, its default, is the build's level brought
+ * into line with the others; 0 is half that and -100 silence, as with
+ * espeak-ng. Above 24000 the samples are bent softly towards full scale
+ * rather than clipped. */
 static void apply_gain(int16_t *samples, long n, double gain)
 {
+    const double knee = 24000.0, room = 32767.0 - knee;
+
     if (gain == 1.0)
         return;
     for (long i = 0; i < n; i++) {
-        long v = lround(samples[i] * gain);
-        samples[i] = (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
+        double v = samples[i] * gain, a = fabs(v);
+
+        if (a > knee)
+            a = knee + room * tanh((a - knee) / room);
+        samples[i] = (int16_t)lround(v < 0 ? -a : a);
     }
 }
 
-/* Hands samples to the server a twentieth of a second at a time, reading
- * the protocol between them so that a stop is heard at once. */
-static void output(int rate, int16_t *samples, long n)
+static double output_gain(int b)
+{
+    double user = settings.volume >= 0 ? 0.5 + 0.5 * settings.volume / 100.0
+                                       : 0.5 * (settings.volume + 100) / 100.0;
+    return builds[b].gain * user;
+}
+
+/* ---- output ----------------------------------------------------------------- */
+
+typedef struct {
+    long position;  /* in the samples handed over, where the mark falls */
+    const char *name;
+} PlacedMark;
+
+static int paused;
+
+/* Reports a mark; a pause asked for stops at the first of Speech
+ * Dispatcher's own marks. */
+static void report_mark(const char *name)
+{
+    module_report_index_mark(name);
+    if (pauseRequested && !strncmp(name, "__spd_", 6))
+        paused = 1;
+}
+
+/* Hands samples to the server a fortieth of a second at a time, putting
+ * each mark in where its word begins and reading the protocol between
+ * blocks so that a stop is heard at once. */
+static void output(int rate, int16_t *samples, long n, PlacedMark *marks,
+                   size_t markCount)
 {
     const uint16_t probe = 1;
-    long block = rate / 20;
+    long block = rate / 40;
+    size_t next = 0;
 
-    for (long at = 0; at < n && !stopRequested; at += block) {
+    for (long at = 0; at < n && !stopRequested && !paused; at += block) {
+        while (next < markCount && marks[next].position <= at && !paused)
+            report_mark(marks[next++].name);
+        if (paused)
+            break;
+
         AudioTrack track = {
             .bits = 16,
             .num_channels = 1,
@@ -937,42 +1307,82 @@ static void output(int rate, int16_t *samples, long n)
                                          ? SPD_AUDIO_LE : SPD_AUDIO_BE);
         module_process(STDIN_FILENO, 0);
     }
+    while (next < markCount && !stopRequested && !paused)
+        report_mark(marks[next++].name);
 }
 
-static void speak_piece(int b, char *text, double sonicSpeed)
+/* Says one piece. The silence before the speech is cut away, and the silence
+ * after it is cut down: to almost nothing at the end of the message, and to
+ * a short pause, shorter as the speech is faster, between sentences. Marks
+ * are placed in proportion to where they stand in the text: the engine says
+ * nothing about where a word falls in its audio, and a mark only has to
+ * come near its word. */
+static void speak_piece(int b, Item *item, int last, double sonicSpeed,
+                        double speed)
 {
     bst *h = engines[b];
     int rate = bst_rate(h);
-    long n = synthesize_safely(h, text);
+    PlacedMark *placed = NULL;
+    long n = 0, start = 0, end = 0, length;
 
-    if (n <= 0)
-        return;
-    apply_gain(pcm, n, volume_gain());
-    if (sonicSpeed == 1.0) {
-        output(rate, pcm, n);
-        return;
+    if (item->text) {
+        n = synthesize_safely(h, item->text);
+        if (n < 0)
+            n = 0;
+    }
+    if (rawOutput) {
+        start = 0;
+        end = length = n;
+    } else {
+        double pause = last ? 0.02
+                     : item->ending == END_SENTENCE ? 0.22 : 0.06;
+        long keep = (long)(pause / speed * rate);
+
+        start = speech_start(pcm, n);
+        end = speech_end(pcm, n);
+        if (end < start)
+            end = start;
+        length = end + (n - end < keep ? n - end : keep) - start;
+        apply_gain(pcm + start, length, output_gain(b));
     }
 
-    sonicStream stream = sonicCreateStream(rate, 1);
-    if (!stream) {
-        output(rate, pcm, n);
-        return;
-    }
-    sonicSetSpeed(stream, (float)sonicSpeed);
-    sonicSetQuality(stream, 1);
-    sonicWriteShortToStream(stream, pcm, (int)n);
-    sonicFlushStream(stream);
-    int available = sonicSamplesAvailable(stream);
-    if (available > 0) {
-        int16_t *out = malloc((size_t)available * sizeof *out);
-        if (out) {
-            int got = sonicReadShortFromStream(stream, out, available);
-            if (got > 0)
-                output(rate, out, got);
-            free(out);
+    int16_t *samples = pcm + start;
+    int16_t *sped = NULL;
+    double scale = 1.0;
+
+    if (sonicSpeed != 1.0 && length > 0) {
+        sonicStream stream = sonicCreateStream(rate, 1);
+
+        if (stream) {
+            sonicSetSpeed(stream, (float)sonicSpeed);
+            sonicSetQuality(stream, 1);
+            sonicWriteShortToStream(stream, samples, (int)length);
+            sonicFlushStream(stream);
+            int available = sonicSamplesAvailable(stream);
+            if (available > 0 && (sped = malloc((size_t)available * sizeof *sped))) {
+                int got = sonicReadShortFromStream(stream, sped, available);
+                scale = (double)got / (double)length;
+                samples = sped;
+                length = got;
+            }
+            sonicDestroyStream(stream);
         }
     }
-    sonicDestroyStream(stream);
+
+    if (item->markCount && (placed = malloc(item->markCount * sizeof *placed))) {
+        double spoken = (double)(end - start) * scale;
+
+        for (size_t k = 0; k < item->markCount; k++) {
+            double share = item->length
+                         ? (double)item->marks[k].offset / (double)item->length
+                         : 1.0;
+            placed[k].position = (long)(share * spoken);
+            placed[k].name = item->marks[k].name;
+        }
+    }
+    output(rate, samples, length, placed, placed ? item->markCount : 0);
+    free(placed);
+    free(sped);
 }
 
 /* ---- the module interface ------------------------------------------------- */
@@ -1044,6 +1454,8 @@ int module_config(const char *configFile)
             double s = atof(a);
             if (s >= 1.0 && s <= 8.0)
                 maxSpeed = s;
+        } else if (!strcasecmp(key, "RawOutput") && n >= 2) {
+            rawOutput = atoi(a) != 0;
         } else if (!strcasecmp(key, "Debug") && n >= 2) {
             debugEnabled = atoi(a) != 0;
         } else {
@@ -1059,10 +1471,13 @@ int module_init(char **statusInfo)
     module_audio_set_server();
     for (int b = 0; b < BUILD_COUNT; b++)
         strictConv[b] = translitConv[b] = (iconv_t)-1;
-    if (open_build(defaultBuild[0]) != 0 || open_build(defaultBuild[1]) != 0) {
-        *statusInfo = copy_string("BestSpeech could not open its engine");
-        return -1;
-    }
+    /* Every build is opened now, so that none costs anything the first time
+       it is asked for. */
+    for (int b = 0; b < BUILD_COUNT; b++)
+        if (open_build(b) != 0) {
+            *statusInfo = copy_string("BestSpeech could not open its engine");
+            return -1;
+        }
     if (build_voice_list() != 0) {
         *statusInfo = copy_string("BestSpeech could not build its voice list");
         return -1;
@@ -1080,50 +1495,45 @@ SPDVoice **module_list_voices(void)
 void module_speak_sync(const char *data, size_t bytes, SPDMessageType type)
 {
     char *message;
-    int b, p, paused = 0;
-    double sonicSpeed;
+    int b, p;
+    double sonicSpeed, speed;
+    size_t lastAudio = 0;
 
     stopRequested = 0;
     pauseRequested = 0;
+    paused = 0;
     clear_items();
+    clear_mark_names();
     resolve_voice(&b, &p);
     if (bytes == SIZE_MAX || open_build(b) != 0
-        || !(message = malloc(bytes + 1))) {
+        || !(message = copy_bytes(data, bytes))) {
         module_speak_error();
         return;
     }
-    memcpy(message, data, bytes);
-    message[bytes] = 0;
     debug_log("speak type %d: %s", (int)type, message);
     if (queue_message(b, message, type) != 0) {
         free(message);
+        clear_items();
         module_speak_error();
         return;
     }
     free(message);
-    configure(b, p, &sonicSpeed);
+    configure(b, p, &sonicSpeed, &speed);
+    for (size_t i = 0; i < itemCount; i++)
+        if (items[i].kind == ITEM_TEXT && items[i].text)
+            lastAudio = i;
 
     module_speak_ok();
     module_report_event_begin();
-    for (size_t i = 0; i < itemCount && !stopRequested; i++) {
-        switch (items[i].kind) {
-        case ITEM_TEXT:
-            speak_piece(b, items[i].value, sonicSpeed);
-            break;
-        case ITEM_MARK:
-            module_report_index_mark(items[i].value);
-            if (pauseRequested && !strncmp(items[i].value, "__spd_", 6))
-                paused = 1;
-            break;
-        case ITEM_ICON:
-            module_report_icon(items[i].value);
-            break;
-        }
+    for (size_t i = 0; i < itemCount && !stopRequested && !paused; i++) {
+        if (items[i].kind == ITEM_ICON)
+            module_report_icon(items[i].text);
+        else
+            speak_piece(b, &items[i], i >= lastAudio, sonicSpeed, speed);
         module_process(STDIN_FILENO, 0);
-        if (paused)
-            break;
     }
     clear_items();
+    clear_mark_names();
     if (paused)
         module_report_event_pause();
     else if (stopRequested)
@@ -1159,6 +1569,10 @@ int module_close(void)
     free(items);
     items = NULL;
     itemCapacity = 0;
+    clear_mark_names();
+    free(markNames);
+    markNames = NULL;
+    markNameCapacity = 0;
     free(pcm);
     pcm = NULL;
     pcmCapacity = 0;

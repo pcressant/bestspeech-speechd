@@ -66,19 +66,52 @@ Le fichier `bestspeech.conf` accepte :
 - `MaxSpeed 4`
 - `Debug 0`
 
+## Réactivité
+
+- **Une synthèse par phrase.** Orca met une marque d'index avant chaque
+  mot. Le module dit la phrase entière d'un seul tenant et place les
+  marques dans son audio, en proportion de leur position dans le texte.
+  Il ne dit plus chaque mot comme une phrase séparée.
+- **Silences coupés.** Le moteur laisse jusqu'à 150 ms de silence avant
+  la parole et 370 à 480 ms après. Le module supprime le silence de
+  début, ramène la fin de message à 20 ms et l'écart entre deux phrases à
+  220 ms au plus. Ces pauses raccourcissent quand le débit augmente.
+- **Premier son en moins d'une milliseconde.** Toutes les versions sont
+  ouvertes au démarrage du module. Une phrase se synthétise bien en
+  dessous de la milliseconde, et un texte long commence à sonner dès sa
+  première phrase. L'arrêt est pris en compte entre deux blocs de 25 ms.
+
+## Volume
+
+Les versions n'ont pas le même niveau : la 2006 sort environ 5 fois
+plus bas que la 1995, et les 1998 saturent. Le module ramène chacune à
+un niveau commun, un peu plus fort qu'espeak-ng. Le volume 100 de Speech
+Dispatcher (sa valeur par défaut) vaut ce niveau, 0 vaut la moitié et
+-100 le silence, comme avec espeak-ng. Au-delà de 24000, les crêtes sont
+arrondies au lieu d'être écrêtées.
+
 ## Particularités du moteur traitées par le module
 
 - **Codage du texte.** Les versions 2006 lisent la page Windows (cp1252).
   Les versions 1995 et 1998 lisent la page DOS (cp850) : un octet
   Windows au-dessus de 0x7f leur fait rendre un silence total. Le module
   convertit l'UTF-8 vers la bonne page. Un caractère absent de la page
-  devient une espace plutôt que « point d'interrogation ». Si une phrase
-  revient vide, elle est redite sans ses caractères accentués.
-- **La virgule dans les versions 2006.** Si on leur donne un texte entier,
-  elles s'arrêtent à la première virgule : « Bonjour, au revoir. » donne
-  « Bonjour ». Le module leur passe donc le texte une proposition à la
-  fois. Entre deux chiffres, la virgule devient « virgule » en français
-  (1,5) et disparaît en anglais (1,000).
+  devient une espace plutôt que « point d'interrogation ».
+- **La virgule dans les versions 2006.** Elles lisent la virgule comme
+  la fin du texte : « Bonjour, au revoir. » donne « Bonjour ». Le
+  deux-points leur donne la même coupure de proposition sans rien
+  arrêter, donc le module le leur passe à la place de la virgule.
+- **Les nombres.** Dans toutes les versions, deux nombres séparés par une
+  espace (« 10 30 », « 1 2 3 ») ou une virgule entre deux chiffres
+  (« 3,5 ») rendent toute la phrase muette. Le module corrige ainsi :
+  - entre deux nombres, il met deux espaces, ce qui fonctionne ;
+  - un groupe de trois chiffres après une espace (« 1 000 ») est un
+    séparateur de milliers : il le colle au nombre précédent ;
+  - « 3,5 » devient « 3 virgule 5 » en français ;
+  - « 10:30 » devient « 10 30 ».
+- **Filet de sécurité.** Une phrase qui contient des mots ne revient
+  jamais muette. Elle est d'abord redite sans ses caractères accentués,
+  puis mot à mot en dernier recours.
 - **Les commandes intégrées** `~v3]`, `~f80]` de la DLL ne sont pas
   comprises par openbst, qui les lit à voix haute. Le module applique
   donc les préréglages par des réglages. Le petit correctif
@@ -103,13 +136,17 @@ d'openbst :
     make OPENBST=/chemin/vers/openbst test
     make PREFIX=/usr/local install
 
-`make test` fait deux choses, sans serveur ni son :
+`make test` fait trois choses, sans serveur ni son :
 
 - il lance le self-test d'openbst sur la bibliothèque réduite et
   corrigée : 1299 énoncés identiques à ce qu'ont dit les binaires
   d'origine ;
-- il pilote le module par son protocole et compare l'audio rendu, sample
-  par sample, avec `bstspeak` pour le même texte.
+- il pilote le module en sortie brute (`RawOutput 1`, réservé aux
+  tests) et compare l'audio, sample par sample, avec `bstspeak` pour le
+  texte que le module doit lui passer ;
+- il pilote le module en sortie normale et contrôle ce qu'entend
+  l'utilisateur : niveau, silences, absence de coupure entre les mots
+  marqués, nombres audibles, arrêt et pause.
 
 ## Installer
 
