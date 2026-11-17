@@ -115,6 +115,16 @@ static const char *const silentFinalCt[] = {
     "suspect",
 };
 
+/* Words in a said "cent". With its c spelled s, "cent" is the engine's
+ * verb ending ("ils sentent"): "pour cent" comes out as "pour s", "récent"
+ * as "rés". These get "sant", which it reads right. A verb in "-cent", as
+ * "ils commencent", keeps it. Words in "-escent" go with them, all but the
+ * verb "acquiescent". */
+static const char *const saidCent[] = {
+    "accent", "cent", "décent", "indécent", "innocent", "munificent",
+    "récent", "réticent",
+};
+
 /* Word beginnings where ch is k, from Greek. psych is k anywhere. */
 static const char *const hardCh[] = {
     "archaï", "archange", "archéo", "chaos", "chaot", "chiro", "chol",
@@ -184,6 +194,13 @@ static size_t spell_c(const uint32_t *in, size_t n, size_t i, size_t start,
         if (prev == 'i' && i >= start + 3 && lower(in[i - 2]) == 'r'
             && lower(in[i - 3]) == 't')
             out[*o - 1] = 'y';
+        /* "déss" is read as the prefix "dés", with a z: "décider" comes out
+           as "dézsider". "dhéss" is read right. */
+        if (prev == 0xE9 && i >= start + 2 && lower(in[i - 2]) == 'd') {
+            out[*o] = out[*o - 1];
+            out[*o - 1] = 'h';
+            (*o)++;
+        }
         out[(*o)++] = 's';
         if (prev && is_vowel(prev))
             out[(*o)++] = 's';
@@ -274,6 +291,15 @@ size_t french_respell(const uint32_t *in, size_t n, uint32_t *out,
             uint32_t next = next_word_letter(in, n, end);
             if (!is_vowel(next) && next != 'h')
                 continue;
+        }
+        if (spellC && l == 'e' && i + 3 == end && i > start
+            && lower(in[i - 1]) == 'c' && lower(in[i + 1]) == 'n'
+            && lower(in[i + 2]) == 't'
+            && (any_word(in, start, end, saidCent, COUNT(saidCent))
+                || (word_ends(in, start, end, "escent")
+                    && !word_ends(in, start, end, "acquiescent")))) {
+            out[o++] = c == 'E' ? 'A' : 'a';
+            continue;
         }
         out[o++] = c;
     }

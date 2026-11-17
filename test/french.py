@@ -18,6 +18,12 @@ CASES = {
     "avec": "avek", "donc": "donk", "blanc": "blan", "ajonc": "ajon",
     "tabac": "taba", "direct": "direktt", "respect": "respet",
     "actrice": "aktrysse",
+    # A said "cent" at the end of a word is not the verb ending.
+    "cent": "sant", "pour cent": "pour sant", "CENT": "sANT",
+    "cents": "sents", "récent": "réssant", "accent": "aksant",
+    "innocent": "innossant", "adolescent": "adolessant",
+    "commencent": "kommensent", "acquiescent": "aquiessent",
+    "décent": "dhéssant", "décider": "dhéssider", "indécis": "indhéssis",
     # The letter alone.
     "c": "sé", "ç": "sé sédille",
     # Après takes its z before a vowel only.

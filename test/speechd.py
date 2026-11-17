@@ -220,6 +220,8 @@ def raw_checks(module, bstspeak):
     assert audio != direct(bstspeak, "2006FRE", "Comme aucun garçon: avec ceci.", "cp1252")
     audio, _, _ = module.speak("c", command="CHAR")
     assert audio == direct(bstspeak, "2006FRE", "sé ", "cp1252")
+    audio, _, _ = module.speak("100 pour cent")
+    assert audio == direct(bstspeak, "2006FRE", "100 pour sant", "ascii")
     audio, _, _ = module.speak("après la pluie")
     assert audio == direct(bstspeak, "2006FRE", "aprè la pluie", "cp1252")
 

@@ -120,12 +120,19 @@ arrondies au lieu d'être écrêtées.
   c doux → s (ss entre voyelles), « accès » → ks, « chrome » et
   « psychologie » → k, « direct » prononcé jusqu'au t, « blanc » et
   « tabac » sans leur c. Seule, la lettre se dit « cé ».
+  Un « cent » final ainsi réécrit serait pris pour la terminaison
+  muette d'un verbe (« pour cent » → « pour s ») : « cent »,
+  « récent », « accent », « innocent », « adolescent »… s'écrivent
+  « sant », alors que « ils commencent » reste un verbe. « déc » devant
+  e ou i (« décider », « décembre ») s'écrit « dhéss », sans quoi le
+  moteur y entend le préfixe « dés » avec un z.
 - **« après »** se dit « aprèz » dans les deux versions françaises, quoi
   qu'il suive ; le module ne garde le z que devant une voyelle.
 - **Vérification au dictionnaire.** `make frcheck WORDS=fr.dic` compare
   les phonèmes de chaque mot d'une liste (le dictionnaire Hunspell
-  français, par exemple) à ceux d'espeak-ng. Sur 63 570 mots : 2006
-  réécrite 12,1 % d'écarts, 2006 brute 35,5 %, 1998 12,6 %. Le reste
+  français, par exemple) à ceux d'espeak-ng, après les règles de
+  liaison du moteur. Sur les 61 539 mots de fr-classique : 2006
+  réécrite 11,4 % d'écarts, 2006 brute 35,0 %, 1998 12,0 %. Le reste
   tient surtout aux o ouverts ou fermés, au [ɥ] de « nuage » et aux mots
   empruntés.
 - **Les commandes intégrées** `~v3]`, `~f80]` de la DLL ne sont pas

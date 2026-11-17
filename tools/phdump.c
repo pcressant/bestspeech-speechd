@@ -29,6 +29,9 @@ int main(int argc, char **argv) {
             z.mode = 0;
             if (!bst_assemble_token(&z, kind, buf)) { if (kind == 6) break; continue; }
             int len = z.len > 0 ? z.len : z.wp + 1;
+            /* The French rules drop the liaison consonants no word wants. */
+            if (len > 0)
+                bst_phrules(img, stream, &len, (int)sizeof stream, 0);
             for (int i = 0; i < len; i++) if (bst_is_sound(stream[i])) printf("%02x ", stream[i]);
             printf("| ");
             memset(stream, 0, sizeof stream);
